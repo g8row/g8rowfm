@@ -1,0 +1,9 @@
+[package]
+name = "g8rowfm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gstreamer = {version = "0.23.4", features = ["v1_22"]}
+tokio = {version = "1.43.0", features = ["full"]}
+warp = "0.3.7"

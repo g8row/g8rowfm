@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>HLS Web Radio</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+</head>
+
+<body>
+    <h1>Web Radio Player</h1>
+    <audio id="audio" controls></audio>
+
+    <script>
+        const audio = document.getElementById('audio');
+
+        if (Hls.isSupported()) {
+            const hls = new Hls();
+            hls.loadSource('http://localhost:8080/hls/playlist.m3u8');
+            hls.attachMedia(audio);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                audio.play().catch(() => {
+                    console.log("User interaction required to start audio");
+                });
+            });
+        } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
+            audio.src = 'http://localhost:8080/hls/playlist.m3u8';
+            audio.addEventListener('loadedmetadata', () => {
+                audio.play().catch(() => {
+                    console.log("User interaction required to start audio");
+                });
+            });
+        }
+    </script>
+</body>
+
+</html>
