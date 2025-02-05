@@ -5,5 +5,6 @@ edition = "2021"
 
 [dependencies]
 gstreamer = {version = "0.23.4", features = ["v1_22"]}
+lofty = "0.22.1"
 tokio = {version = "1.43.0", features = ["full"]}
 warp = "0.3.7"
