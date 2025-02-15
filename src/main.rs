@@ -1,49 +1,313 @@
-use gstreamer::{parse::launch, prelude::*};
+mod metadata;
+mod processor;
+
+use futures_util::{StreamExt, TryStreamExt};
+use metadata::TrackMetadata;
+use processor::process_file_with_eos;
 use std::{
-    fs,
+    env, fs,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::Duration,
 };
-use warp::Filter;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::AsyncWriteExt,
+};
+use warp::{
+    filters::multipart::FormData,
+    reject::Rejection,
+    reply::{json, Reply},
+    Buf, Filter,
+};
+
+const PLAYLIST_FILE: &str = "playlist.txt";
 
 #[tokio::main]
 async fn main() {
+    if Path::new("segments").exists() {
+        fs::remove_dir_all("segments").expect("Failed to delete segments folder");
+    }
     fs::create_dir_all("segments").expect("Failed to create segments directory");
 
-    let music_dir = "/home/alex/Downloads/music";
-    let files = Arc::new(get_flac_files(music_dir));
-    if files.is_empty() {
-        panic!("No FLAC files found in {}", music_dir);
+    let mut args = env::args().skip(1);
+    let mut port_arg = None;
+    let mut dir_arg = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--port" => match args.next() {
+                Some(value) => port_arg = Some(value),
+                None => {
+                    eprintln!("Error: --port requires a value");
+                    return;
+                }
+            },
+            "--dir" => match args.next() {
+                Some(value) => dir_arg = Some(value),
+                None => {
+                    eprintln!("Error: --dir requires a value");
+                    return;
+                }
+            },
+            _ => {
+                eprintln!("Error: Unknown argument '{}'", arg);
+                return;
+            }
+        }
     }
 
-    let current_index = Arc::new(Mutex::new(0));
-    let segment_counter = Arc::new(Mutex::new(0));
-    let preparing_next = Arc::new(Mutex::new(false));
+    let port;
+    let dir;
 
-    let gst_files = Arc::clone(&files);
-    let gst_index = Arc::clone(&current_index);
-    let gst_segments = Arc::clone(&segment_counter);
-    let gst_next_flag = Arc::clone(&preparing_next);
+    match (port_arg, dir_arg) {
+        (Some(p), Some(d)) => {
+            port = p;
+            dir = d;
+        }
+        (None, _) => {
+            eprintln!("Error: Missing required argument --port");
+            return;
+        }
+        (_, None) => {
+            eprintln!("Error: Missing required argument --dir");
+            return;
+        }
+    }
 
-    thread::spawn(move || {
-        gstreamer::init().unwrap();
-        run_gstreamer_pipeline(gst_files, gst_index, gst_segments, gst_next_flag);
+    let dir_clone = dir.clone();
+
+    let restart_flag = Arc::new(AtomicBool::new(false));
+    let current_track = Arc::new(Mutex::new(TrackMetadata::default()));
+    let track_state = current_track.clone();
+
+    let restart_clone = restart_flag.clone();
+
+    thread::spawn(move || loop {
+        let files = Arc::new(Mutex::new(load_playlist(&dir.clone())));
+        process_file_with_eos(files.clone(), track_state.clone(), restart_clone.clone());
+        thread::sleep(std::time::Duration::from_secs(1));
     });
 
-    let hls = warp::path("hls").and(warp::fs::dir("segments"));
-    let routes = hls;
+    let playlist_ui =
+        warp::path("playlist").map(|| warp::reply::html(include_str!("playlist.html")));
 
-    println!("Server running at http://localhost:8080");
-    warp::serve(routes).run(([127, 0, 0, 1], 8080)).await;
+    let get_playlist = warp::path("api")
+        .and(warp::path("playlist"))
+        .and(warp::get())
+        .map(|| {
+            let content = fs::read_to_string(PLAYLIST_FILE).unwrap_or_default();
+            warp::reply::json(&content.lines().collect::<Vec<_>>())
+        });
+
+    let save_playlist = warp::path("api")
+        .and(warp::path("playlist"))
+        .and(warp::put())
+        .and(warp::body::bytes())
+        .and_then(|bytes: warp::hyper::body::Bytes| async move {
+            let content = String::from_utf8_lossy(&bytes).to_string();
+            match tokio::fs::write(PLAYLIST_FILE, content).await {
+                Ok(_) => {
+                    println!("Playlist saved successfully.");
+                    Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&"Playlist updated"),
+                        warp::http::StatusCode::OK,
+                    ))
+                }
+                Err(e) => {
+                    eprintln!("Failed to write playlist: {}", e);
+                    Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&"Failed to update playlist"),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ))
+                }
+            }
+        });
+
+    let restart = {
+        let restart_flag = restart_flag.clone();
+        warp::path("api")
+            .and(warp::path("restart"))
+            .and(warp::post())
+            .map(move || {
+                restart_flag.store(true, Ordering::SeqCst);
+                warp::reply::json(&"Playback restarted with new playlist")
+            })
+    };
+
+    let current_song = {
+        let state = current_track.clone();
+        warp::path("current-song").map(move || {
+            let track = state.lock().unwrap();
+            warp::reply::json(&track.title)
+        })
+    };
+
+    let current_artist = {
+        let state = current_track.clone();
+        warp::path("current-artist").map(move || {
+            let track = state.lock().unwrap();
+            warp::reply::json(&track.artist)
+        })
+    };
+
+    let current_album = {
+        let state = current_track.clone();
+        warp::path("current-album").map(move || {
+            let track = state.lock().unwrap();
+            warp::reply::json(&track.album)
+        })
+    };
+
+    let current_cover = {
+        let state = current_track.clone();
+        warp::path("current-cover").map(move || {
+            let track = state.lock().unwrap();
+            warp::reply::json(&track.cover)
+        })
+    };
+
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_headers(vec![
+            "User-Agent",
+            "Sec-Fetch-Mode",
+            "Referer",
+            "Origin",
+            "Access-Control-Request-Method",
+            "Access-Control-Request-Headers",
+            "Content-Type",
+            "Accept",
+            "Authorization",
+            "content-type",
+            "type",
+        ])
+        .allow_methods(vec!["GET", "POST", "DELETE", "OPTIONS"]);
+
+    let hls_route = warp::path("hls")
+        .and(warp::fs::dir("segments"))
+        .with(warp::reply::with::header(
+            "Content-Type",
+            "application/vnd.apple.mpegurl",
+        ))
+        .with(warp::reply::with::header(
+            "Cache-Control",
+            "no-cache, no-store, must-revalidate",
+        ))
+        .with(warp::reply::with::header(
+            "Access-Control-Allow-Origin",
+            "*",
+        ))
+        .with(warp::reply::with::header(
+            "Access-Control-Expose-Headers",
+            "Content-Length",
+        ));
+    let upload_flac = warp::path("api")
+        .and(warp::path("upload"))
+        .and(warp::post())
+        .and(warp::multipart::form().max_length(100_000_000))
+        .and(warp::any().map(move || dir_clone.clone()))
+        .and_then(handle_file_upload)
+        .with(&cors);
+
+    let routes = warp::path::end()
+        .map(|| warp::reply::html(include_str!("index.html")))
+        .or(hls_route)
+        .or(current_song)
+        .or(current_artist)
+        .or(current_album)
+        .or(current_cover)
+        .or(restart)
+        .or(playlist_ui)
+        .or(get_playlist)
+        .or(save_playlist)
+        .or(upload_flac)
+        .with(&cors);
+    println!("Server running at http://localhost:{}", port);
+    warp::serve(routes)
+        .run(([127, 0, 0, 1], port.parse().unwrap()))
+        .await;
+}
+
+async fn handle_file_upload(form: FormData, dir: String) -> Result<impl Reply, Rejection> {
+    let mut parts = form.into_stream();
+    while let Ok(part) = parts.next().await.unwrap() {
+        if let Some(filename) = part.filename() {
+            if !filename.ends_with(".flac") {
+                return Ok(warp::reply::with_status(
+                    json(&"Only FLAC files allowed"),
+                    warp::http::StatusCode::BAD_REQUEST,
+                ));
+            }
+
+            let mut filepath = format!("{}/{}", &dir, filename);
+            let mut file = match File::create(&filepath).await {
+                Ok(f) => f,
+                Err(_) => {
+                    return Ok(warp::reply::with_status(
+                        json(&"Failed to create file"),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ));
+                }
+            };
+
+            let mut stream = part.stream();
+            while let Some(chunk) = stream.try_next().await.unwrap_or(None) {
+                if file.write_all(&chunk.chunk()).await.is_err() {
+                    return Ok(warp::reply::with_status(
+                        json(&"Failed to write file"),
+                        warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ));
+                }
+            }
+            let mut file = OpenOptions::new()
+                .append(true) // Open the file in append mode
+                .create(true) // Create the file if it doesn't exist
+                .open(PLAYLIST_FILE)
+                .await
+                .unwrap();
+            filepath.insert_str(0, "\n");
+            file.write_all(filepath.as_bytes()).await.unwrap();
+
+            return Ok(warp::reply::with_status(
+                json(&"File uploaded successfully"),
+                warp::http::StatusCode::OK,
+            ));
+        }
+    }
+
+    Ok(warp::reply::with_status(
+        json(&"No file provided"),
+        warp::http::StatusCode::BAD_REQUEST,
+    ))
+}
+
+fn load_playlist(dir: &str) -> Vec<String> {
+    if Path::new(PLAYLIST_FILE).exists() {
+        if let Ok(content) = fs::read_to_string(PLAYLIST_FILE) {
+            let files: Vec<String> = content
+                .lines()
+                .map(String::from)
+                .filter(|f| Path::new(f).exists())
+                .collect();
+            if !files.is_empty() {
+                return files;
+            }
+        }
+    }
+    let files = get_flac_files(dir);
+    if !files.is_empty() {
+        let _ = fs::write(PLAYLIST_FILE, files.join("\n"));
+    }
+    files
 }
 
 fn get_flac_files(dir: &str) -> Vec<String> {
-    let path = Path::new(dir);
-    let mut files = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(path) {
+    let mut files = vec![];
+    if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() && path.extension().map_or(false, |e| e == "flac") {
@@ -55,131 +319,4 @@ fn get_flac_files(dir: &str) -> Vec<String> {
     }
     files.sort();
     files
-}
-
-fn run_gstreamer_pipeline(
-    files: Arc<Vec<String>>,
-    current_index: Arc<Mutex<usize>>,
-    segment_counter: Arc<Mutex<usize>>,
-    preparing_next: Arc<Mutex<bool>>,
-) {
-    loop {
-        let index = *current_index.lock().unwrap();
-        let current_file = &files[index];
-
-        println!("Starting track: {}", current_file);
-
-        let playlist_path = "segments/playlist.m3u8";
-        let segment_prefix = "segments/segment";
-
-        launch_pipeline(current_file, playlist_path, segment_prefix);
-
-        let segment_duration = Duration::from_secs(10);
-        let song_duration = get_song_duration(current_file);
-
-        let mut elapsed_time = Duration::ZERO;
-
-        while elapsed_time < song_duration {
-            thread::sleep(segment_duration);
-            elapsed_time += segment_duration;
-            update_playlist(playlist_path, &mut *segment_counter.lock().unwrap());
-
-            if elapsed_time + (segment_duration * 5) >= song_duration {
-                let mut next_flag = preparing_next.lock().unwrap();
-                if !*next_flag {
-                    *next_flag = true;
-                    let next_index = (index + 1) % files.len();
-                    let next_file = Arc::clone(&files);
-                    println!("Pre-generating next track: {}", next_file[next_index]);
-
-                    let next_playlist_path = "segments/next_playlist.m3u8";
-                    let next_segment_prefix = "segments/next_segment";
-
-                    let next_file_path = next_file[next_index].clone();
-                    thread::spawn(move || {
-                        launch_pipeline(&next_file_path, next_playlist_path, next_segment_prefix);
-                    });
-                }
-            }
-        }
-
-        *preparing_next.lock().unwrap() = false;
-
-        println!("Switching to next track...");
-        fs::rename("segments/next_playlist.m3u8", "segments/playlist.m3u8")
-            .expect("Failed to swap playlists");
-
-        *current_index.lock().unwrap() = (index + 1) % files.len();
-    }
-}
-
-fn launch_pipeline(file: &str, playlist: &str, segment_prefix: &str) {
-    let pipeline_str = format!(
-        "filesrc location=\"{}\" ! \
-        flacparse ! flacdec ! \
-        audioconvert ! audioresample ! \
-        avenc_ac3 bitrate=640000 ! \
-        hlssink2 name=hlssink \
-        location={}%05d.ts \
-        playlist-location={} \
-        target-duration=10 \
-        max-files=10000 \
-        playlist-length=10000",
-        file, segment_prefix, playlist
-    );
-
-    let pipeline = launch(&pipeline_str).expect("Failed to parse pipeline");
-    pipeline.set_state(gstreamer::State::Playing).unwrap();
-
-    println!("GStreamer pipeline running for: {}", file);
-}
-
-fn get_song_duration(file_path: &str) -> Duration {
-    use lofty::{prelude::AudioFile, probe::Probe};
-
-    let tagged_file = Probe::open(file_path)
-        .expect("Failed to open file")
-        .read()
-        .expect("Failed to read metadata");
-
-    let properties = tagged_file.properties();
-    return Duration::from_secs(properties.duration().as_secs());
-}
-
-fn update_playlist(playlist_path: &str, segment_counter: &mut usize) {
-    let playlist = fs::read_to_string(playlist_path).unwrap_or_else(|_| "".to_string());
-    let mut lines: Vec<&str> = playlist.lines().collect();
-
-    let segment_lines: Vec<&str> = lines
-        .iter()
-        .filter(|line| line.contains(".ts"))
-        .cloned()
-        .collect();
-
-    let max_segments = 10;
-    let min_segments = 5;
-
-    if segment_lines.len() > max_segments {
-        let remove_count = segment_lines.len() - min_segments;
-
-        for line in &segment_lines[..remove_count] {
-            if let Some(ts_file) = line.strip_prefix("#EXTINF:") {
-                let ts_path = format!("segments/{}", ts_file.trim());
-                if fs::remove_file(&ts_path).is_ok() {
-                    println!("Removed old segment: {}", ts_path);
-                }
-            }
-        }
-
-        lines = lines[remove_count * 2..].to_vec();
-    }
-
-    let new_segment = format!("segment{:05}.ts", *segment_counter);
-    *segment_counter += 1;
-
-    lines.push("#EXTINF:10,");
-    lines.push(&new_segment);
-
-    fs::write(playlist_path, lines.join("\n")).expect("Failed to update playlist");
-    println!("Updated playlist with new segment: {}", new_segment);
 }

@@ -1,35 +1,205 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
-    <title>HLS Web Radio</title>
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Music Player</title>
+    <style>
+        :root {
+            --primary: #ffffff;
+            --background: rgba(0, 0, 0, 0.8);
+        }
+
+        body {
+            background: radial-gradient(circle, rgba(20, 20, 20, 0.3) 0%, rgba(0, 0, 0, 0.95) 80%);
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Inter', sans-serif;
+            color: white;
+            position: relative;
+        }
+
+        /* Soft mist effect, but much darker */
+        body::before {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at top, rgba(50, 50, 50, 0.1) 0%, transparent 40%);
+            pointer-events: none;
+        }
+
+        /* Subtle animated grain effect */
+        body::after {
+            content: "";
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.015) 0px, rgba(255, 255, 255, 0.015) 1px, transparent 1px, transparent 2px),
+                repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.015) 0px, rgba(255, 255, 255, 0.015) 1px, transparent 1px, transparent 2px);
+            opacity: 0.03;
+            animation: grain 1.2s steps(10) infinite;
+            pointer-events: none;
+        }
+
+        /* Grain animation */
+        @keyframes grain {
+            0% {
+                transform: translate(0, 0);
+            }
+
+            100% {
+                transform: translate(-1px, -1px);
+            }
+        }
+
+        .player {
+            backdrop-filter: blur(20px);
+            border-radius: 24px;
+            padding: 2rem;
+            width: 400px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            text-align: center;
+        }
+
+        .artwork {
+            width: 100%;
+            height: 300px;
+            border-radius: 16px;
+            background-size: cover;
+            background-position: center;
+            margin-bottom: 1.5rem;
+            filter: grayscale(100%) contrast(120%);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .artwork::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(to top, rgba(0, 0, 0, 0.8) 20%, transparent 80%);
+        }
+
+        .info {
+            text-align: center;
+            margin-bottom: 1rem;
+        }
+
+        .title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .artist,
+        .album {
+            font-size: 1.1rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .artist {
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .album {
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        /* Hide the default audio controls */
+        audio {
+            display: none;
+        }
+
+        /* Style the custom play/pause button */
+        #playPause {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 1.5rem;
+            cursor: pointer;
+            margin-top: 1rem;
+        }
+    </style>
 </head>
 
 <body>
-    <h1>Web Radio Player</h1>
-    <audio id="audio" controls></audio>
+    <div class="player">
+        <div class="artwork" id="artwork"></div>
+        <div class="info">
+            <div class="title" id="title">Loading...</div>
+            <div class="artist" id="artist">Artist</div>
+            <div class="album" id="album">Album</div>
+        </div>
+        <!-- Hidden audio element -->
+        <audio id="audio"></audio>
+        <!-- Custom play/pause button -->
+        <button id="playPause">Play</button>
+    </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <script>
+        const artwork = document.getElementById('artwork');
+        const titleElem = document.getElementById('title');
+        const artistElem = document.getElementById('artist');
+        const albumElem = document.getElementById('album');
         const audio = document.getElementById('audio');
+        const playPauseButton = document.getElementById('playPause');
 
+        // Initialize HLS.js if supported
+        const hls = new Hls({
+            debug: true,
+            enableWorker: true,
+            highBufferWatchdogPeriod: 1, // Check buffer every second
+            liveDurationInfinity: true,  // Treat as infinite live stream
+        });
         if (Hls.isSupported()) {
-            const hls = new Hls();
-            hls.loadSource('http://localhost:8080/hls/playlist.m3u8');
             hls.attachMedia(audio);
-            hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                audio.play().catch(() => {
-                    console.log("User interaction required to start audio");
-                });
-            });
-        } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
-            audio.src = 'http://localhost:8080/hls/playlist.m3u8';
-            audio.addEventListener('loadedmetadata', () => {
-                audio.play().catch(() => {
-                    console.log("User interaction required to start audio");
-                });
-            });
+            hls.loadSource('/hls/playlist.m3u8');
+        } else {
+            audio.src = '/hls/playlist.m3u8';
         }
+
+        // Update metadata periodically
+        function updateMetadata() {
+            Promise.all([
+                fetch('/current-song').then(r => r.text()),
+                fetch('/current-artist').then(r => r.text()),
+                fetch('/current-album').then(r => r.text()),
+                fetch('/current-cover').then(r => r.text())
+            ])
+                .then(([songData, artistData, albumData, coverData]) => {
+                    titleElem.textContent = songData;
+                    artistElem.textContent = artistData;
+                    albumElem.textContent = albumData;
+                    artwork.style.backgroundImage = `url(${coverData})`;
+                })
+                .catch(e => console.error('Error fetching metadata:', e));
+        }
+        setInterval(updateMetadata, 1000);
+        updateMetadata();
+
+        // Custom play/pause toggle
+        playPauseButton.addEventListener('click', () => {
+            if (audio.paused) {
+                audio.play().then(() => {
+                    playPauseButton.textContent = 'Pause';
+                }).catch(() => {
+                    console.log("User interaction required to start audio");
+                });
+            } else {
+                audio.pause();
+                playPauseButton.textContent = 'Play';
+            }
+        });
     </script>
 </body>
 

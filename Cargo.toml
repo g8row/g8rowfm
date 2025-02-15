@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gstreamer = {version = "0.23.4", features = ["v1_22"]}
-lofty = "0.22.1"
+base64 = "0.22.1"
+futures-util = "0.3.31"
+gstreamer = "0.23.4"
+metaflac = "0.2.8"
+mime_guess = "2.0.5"
 tokio = {version = "1.43.0", features = ["full"]}
 warp = "0.3.7"

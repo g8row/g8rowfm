@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Playlist Manager</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+        }
+
+        #playlist {
+            list-style: none;
+            padding: 0;
+            width: 80%;
+            margin: auto;
+        }
+
+        li {
+            padding: 10px;
+            margin: 5px;
+            background: #eee;
+            cursor: grab;
+            border-radius: 5px;
+        }
+
+        button {
+            margin: 10px;
+            padding: 10px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Playlist Manager</h1>
+    <ul id="playlist"></ul>
+
+    <input type="file" id="fileInput" accept=".flac" style="display:none;">
+    <button onclick="uploadSong()">Add New Song</button>
+    <button onclick="savePlaylist()">Save Playlist</button>
+    <button onclick="restartPlayback()">Restart Playback</button>
+
+    <script>
+        async function fetchPlaylist() {
+            let response = await fetch("/api/playlist");
+            let songs = await response.json();
+            let playlist = document.getElementById("playlist");
+            playlist.innerHTML = "";
+            songs.forEach(song => {
+                let li = document.createElement("li");
+                li.textContent = song;
+                playlist.appendChild(li);
+            });
+        }
+
+        async function savePlaylist() {
+            let playlistItems = [...document.querySelectorAll("#playlist li")].map(li => li.textContent);
+            await fetch("/api/playlist", {
+                method: "PUT",
+                headers: { "Content-Type": "text/plain" },
+                body: playlistItems.join("\n")
+            });
+            alert("Playlist saved!");
+        }
+
+        async function restartPlayback() {
+            await fetch("/api/restart", { method: "POST" });
+            alert("Playback restarted!");
+        }
+
+        function uploadSong() {
+            document.getElementById("fileInput").click();
+        }
+
+        document.getElementById("fileInput").addEventListener("change", async function () {
+            let file = this.files[0];
+            if (!file || !file.name.endsWith(".flac")) {
+                alert("Only FLAC files allowed!");
+                return;
+            }
+            let formData = new FormData();
+            formData.append("file", file);
+            const response = await fetch("http://localhost:8080/api/upload", {
+                method: "POST",
+                body: formData,
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                console.error("Upload failed:", error);
+                return;
+            }
+
+            const result = await response.json();
+            console.log("Upload successful:", result);
+            alert("Song uploaded! Refreshing playlist...");
+            fetchPlaylist();
+        });
+
+        // Enable drag & drop sorting
+        new Sortable(document.getElementById("playlist"), {
+            animation: 150
+        });
+
+        // Load playlist on page load
+        fetchPlaylist();
+    </script>
+</body>
+
+</html>
